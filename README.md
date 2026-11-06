@@ -44,10 +44,11 @@ at upstream list price — as a pi provider.
   base price, including cache reads.
 - **Privacy routing:** `/nano-gpt-zdr` reads and switches the active inference
   key's live Zero Data Retention policy through NanoGPT's Management API.
-- **Web tools:** `nano_gpt_web_search` and `nano_gpt_web_scrape` expose NanoGPT's
-  standalone search and page-reading APIs to any tool-capable model in pi.
-  They reuse the inference key and are billed separately from model tokens.
-  See [Web search and scraping](#web-search-and-scraping).
+- **Web tools:** standalone search, page reading, targeted extraction, site
+  mapping/crawling, YouTube transcripts, and multi-source research are available
+  to any tool-capable model in pi. All reuse the inference key, require no extra
+  dependencies, and are billed separately from model tokens; subscription-only
+  mode blocks them. See [Web tools](#web-tools).
 
 ## Install
 
@@ -170,23 +171,33 @@ The toggle re-registers the provider immediately (no `/reload`) and refetches
 the catalogue from the matching endpoint. If the current model is not in the
 new catalogue you are prompted to `/model` again.
 
-## Web search and scraping
+## Web tools
 
-Two ordinary pi tools are registered automatically; no MCP server, extra key,
+Seven ordinary pi tools are registered automatically; no MCP server, extra key,
 model suffix, or npm dependency is needed. They work with **any tool-capable
-model**, not just models served by NanoGPT. Ask pi to search for current
-information or read a public URL, and the model can call:
+model**, not just models served by NanoGPT. Ask pi to search, read or extract
+public pages, map/crawl a site, retrieve video transcripts, or research a topic:
 
 | Tool | Purpose | NanoGPT endpoint |
 |---|---|---|
 | `nano_gpt_web_search` | Search with explicit query and source URLs | `POST https://nano-gpt.com/api/web` |
 | `nano_gpt_web_scrape` | Read 1–5 public pages as markdown or HTML | `POST https://nano-gpt.com/api/scrape-urls` |
+| `nano_gpt_web_extract` | Extract requested facts from one page via Sofya | `POST https://api.nano-gpt.com/api/web` |
+| `nano_gpt_site_map` | Discover a bounded set of site URLs via Firecrawl | `POST https://api.nano-gpt.com/api/v1/data/firecrawl` |
+| `nano_gpt_site_crawl` | Retrieve bounded site pages as markdown via Firecrawl | `POST https://api.nano-gpt.com/api/v1/data/firecrawl` |
+| `nano_gpt_youtube_transcript` | Retrieve transcripts for 1–10 YouTube videos | `POST https://api.nano-gpt.com/api/youtube-transcribe` |
+| `nano_gpt_web_research` | Produce a cited multi-source report via Sofya | `POST https://api.nano-gpt.com/api/web` |
 
-Both use the existing `NANO_GPT_API_KEY` / `nano-gpt.json` inference key, never
+All use the existing `NANO_GPT_API_KEY` / `nano-gpt.json` inference key, never
 the Management API token. They do not change inference requests or silently
 add `:online` / `scraping` options. Provider routing pins, service tiers, and
 Claude caching do not apply to these standalone requests. Without a key, calls
 fail with setup instructions rather than making an unauthenticated request.
+
+Search and scrape keep using `https://nano-gpt.com`. The other five tools use
+`https://api.nano-gpt.com` for longer runtimes, following the
+[API Hosts documentation](https://docs.nano-gpt.com/api-reference/miscellaneous/api-hosts).
+The direct host is **IPv4-only**; there is no automatic host fallback or retry.
 
 ### Search options
 
@@ -238,23 +249,123 @@ batch returns the usable pages plus errors; an entirely failed batch is marked
 as a tool error. See the
 [Web Scraping API](https://docs.nano-gpt.com/api-reference/endpoint/scrape-urls).
 
+### Targeted extraction
+
+Use `nano_gpt_web_extract` to extract specific information from one public page:
+
+```json
+{
+  "url": "https://nodejs.org/en/about/previous-releases",
+  "prompt": "List the currently supported LTS releases and their end-of-life dates."
+}
+```
+
+The tool sends `provider: "sofya"`, `operation: "extract"`, `url`, and `prompt`
+to `/api/web`. `timeout` is 1–180 seconds, default 120. Output preserves provider
+`data` and billing `metadata`; the prompt does not guarantee a JSON schema.
+
+### Site mapping and crawling
+
+Discover URLs with `nano_gpt_site_map`:
+
+```json
+{ "url": "https://nodejs.org", "search": "release", "limit": 25, "maxTotalChargeUsd": 0.50 }
+```
+
+Retrieve pages with `nano_gpt_site_crawl`:
+
+```json
+{ "url": "https://nodejs.org/en/about", "limit": 5, "maxReturnedPages": 3, "maxTotalChargeUsd": 0.50 }
+```
+
+Both submit `operation: "map"` or `"crawl"` to `/api/v1/data/firecrawl`:
+
+- Map: `limit` 1–100, default 25; optional `search` filters discovered URLs.
+- Crawl: `limit` 1–20, default 5; `maxReturnedPages` 1–`limit`, default `limit`.
+  The request sets `formats: ["markdown"]`. Returning fewer pages does not by
+  itself reduce the number processed or billed.
+- **`maxTotalChargeUsd` is required**, greater than $0 and at most $5. It is sent
+  upstream as a requested spending cap, not a verified guarantee: the official
+  NanoGPT MCP exposes this field, but server-side enforcement has not been
+  independently verified. Agree on a spending cap before submitting.
+- `waitForFinishSecs`: 5–240 seconds, default 240 (NanoGPT caps the server wait
+  at 240). `timeout`: 1–300 seconds, default 270, and must be at least
+  `waitForFinishSecs + 30`. Lower the server wait when choosing a shorter timeout.
+  The map/crawl page bounds and $5 budget bound are extension safety limits,
+  not claims about NanoGPT's maximums.
+
+Each call makes **one POST, with no polling or automatic resubmission**. The
+response schema and asynchronous continuation contract are undocumented. Full
+JSON is retained, including any job, status, data, billing, and partial failures;
+a returned job/status does **not** prove completion. Inspect the response rather
+than assuming an empty or pending result is finished. Do not automatically
+resubmit when completion is unknown: cancellation, timeout, or reaching the
+server wait may not stop remote jobs or spending.
+
+### YouTube transcripts
+
+Use `nano_gpt_youtube_transcript` instead of page scraping for supported videos:
+
+```json
+{ "urls": ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"] }
+```
+
+- `urls`: 1–10 YouTube video URLs in watch, `youtu.be` shortlink, embed, or live
+  form; channel and playlist URLs are not supported.
+- `timeout`: 1–180 seconds, default 120.
+
+The request sends `{ "urls": [...] }` to `/api/youtube-transcribe`, authenticating
+with the inference key in `x-api-key`. Per-video errors and the billing `summary`
+are preserved; a partially successful batch retains its usable transcripts and
+an entirely failed batch is marked as a tool error. Transcript availability is
+not guaranteed. This tool does not upload or transcribe local media. See the
+[YouTube Transcription API](https://docs.nano-gpt.com/api-reference/endpoint/youtube-transcribe).
+
+### Multi-source research
+
+Use `nano_gpt_web_research` for an **explicit research task**, not a simple
+lookup: it costs more than basic search.
+
+```json
+{
+  "query": "Compare the current Node.js LTS release support timelines using official sources.",
+  "maxSources": 10,
+  "topic": "general",
+  "freshness": "year"
+}
+```
+
+The tool sends `provider: "sofya"`, `operation: "research"`, and the query to
+`/api/web`. Options are `maxSources` 5–30 (default 10), `topic` `general` or
+`news` (default `general`), and optional `freshness`: `day`, `week`, `month`,
+`year`, or `YYYY-MM-DD:YYYY-MM-DD`. `timeout` is 1–300 seconds, default 270.
+Provider data, citations, and billing metadata are retained; verify citations
+before relying on the report. See the
+[Direct Web Search API](https://docs.nano-gpt.com/api-reference/endpoint/web-search)
+for Sofya extraction and research details, and the
+[Data Extraction APIs](https://docs.nano-gpt.com/api-reference/endpoint/data-extraction)
+for Firecrawl.
+
 ### Billing, privacy, and limits
 
 **Web requests are billed separately from inference/subscription quotas.**
 NanoGPT currently documents Linkup standard search at $0.006/request, deep at
-$0.06/request, and standard scraping at $0.001/successful URL; other providers,
-stealth mode, or BYOK have different billing. Consult the linked API docs for
-current rates. The tool output includes upstream-reported costs when present;
-these are not added to pi's model-token cost estimate.
+$0.06/request, and standard scraping at $0.001/successful URL. Sofya extraction
+is documented at $0.02625/request and research at $0.13125/request; YouTube at
+$0.01/successful transcript. Firecrawl uses variable, credit-based pricing.
+Other providers, stealth mode, or BYOK have different billing. Consult the
+linked API docs for current rates. The tool output includes upstream-reported
+costs when present; these are not added to pi's model-token cost estimate.
+Tool bounds are local safety limits, not claims about API maxima.
 
-To preserve the extension's no-balance-spending guarantee, both tools **refuse
+To preserve the extension's no-balance-spending guarantee, all seven tools **refuse
 to run while `/nano-gpt-subscription on` is active**, including after reload.
 Use `/nano-gpt-subscription off` to allow paid web requests. The tools remain
 registered so the model can see the reason for refusal; there is no hidden
 pay-as-you-go fallback. Requests are never automatically retried: even a
 cancelled or timed-out request may already have been billed.
 
-Queries and URLs are sent to NanoGPT and its search/page-reading providers.
+Queries, prompts, and URLs are sent to NanoGPT and its upstream providers.
 **Inference ZDR routing does not establish ZDR guarantees for these tools.**
 Retrieved content is untrusted source material, not instructions.
 
@@ -264,8 +375,10 @@ in the OS temporary directory; the result includes its path. Long lines in the
 text artifact are soft-wrapped so pi's `read` tool can continue with line offsets
 (the artifact is not machine-readable JSON). These files are
 not automatically deleted at session end, so they remain readable; remove them
-when no longer needed. Responses larger than 10 MiB are rejected as a safety
-limit. Esc cancellation and the request timeout apply to response downloads as
+when no longer needed. Oversized billing metadata is also bounded in persisted
+tool details; the complete response remains in the output text/artifact.
+Responses larger than 10 MiB are rejected as a safety limit. Esc cancellation
+and the request timeout apply to response downloads as
 well as connection setup. HTTP/API errors are reported without automatic retries.
 
 ## Claude prompt caching
@@ -417,6 +530,7 @@ npm run check   # runs node --test (Node.js 22.19.0+)
 - `test/model-catalogue.test.mjs` — canonical endpoint, discovery, and billing-mode regression test
 - `test/service-tier.test.mjs` — runtime switch integration test
 - `test/web-tools.test.mjs` — web API contracts, billing guard, cancellation, output limits, and extension integration
+- `test/research-tools.test.mjs` — extraction, site map/crawl, YouTube transcript, and research API contracts and safeguards
 - `LICENSE` — MIT license
 
 ## License

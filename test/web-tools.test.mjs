@@ -29,9 +29,12 @@ function setup(t, { apiKey = "test-key", subscriptionOnly = false } = {}) {
 
 function text(result) { return result.content.map((block) => block.text).join("\n"); }
 
-test("registers two dependency-free tools with strict portable JSON schemas", (t) => {
+test("registers seven dependency-free tools with strict portable JSON schemas", (t) => {
   const { tools, requests } = setup(t);
-  assert.deepEqual([...tools.keys()], ["nano_gpt_web_search", "nano_gpt_web_scrape"]);
+  assert.deepEqual([...tools.keys()], [
+    "nano_gpt_web_search", "nano_gpt_web_scrape", "nano_gpt_web_extract", "nano_gpt_site_map",
+    "nano_gpt_site_crawl", "nano_gpt_youtube_transcript", "nano_gpt_web_research",
+  ]);
   for (const tool of tools.values()) {
     assert.equal(tool.parameters.type, "object");
     assert.equal(tool.parameters.additionalProperties, false);
@@ -310,14 +313,28 @@ test("extension integration: file key, any selected model, live billing switch, 
   await load(pi);
   const ctx = { hasUI: false, model: { id: "other-model", provider: "another-provider" }, ui: { notify() {}, setStatus() {} } };
   const search = () => tools.get("nano_gpt_web_search").execute("id", { query: "q" }, undefined, undefined, ctx);
+  const newTools = {
+    nano_gpt_web_extract: { url: "https://example.com", prompt: "Extract prices" },
+    nano_gpt_site_map: { url: "https://example.com", maxTotalChargeUsd: 0.1 },
+    nano_gpt_site_crawl: { url: "https://example.com", maxTotalChargeUsd: 0.1 },
+    nano_gpt_youtube_transcript: { urls: ["https://youtu.be/dQw4w9WgXcQ"] },
+    nano_gpt_web_research: { query: "Compare APIs" },
+  };
+  const assertNewToolsBlocked = async (reason) => {
+    for (const [name, args] of Object.entries(newTools)) {
+      await assert.rejects(tools.get(name).execute("id", args, undefined, undefined, ctx), reason);
+    }
+  };
   await search();
   await commands.get("nano-gpt-subscription").handler("on", ctx);
   const before = requests.length;
   await assert.rejects(search(), /subscription-only/);
+  await assertNewToolsBlocked(/subscription-only/);
   assert.equal(requests.length, before);
   assert.equal(JSON.parse(readFileSync(config, "utf8")).apiKey, "file-key");
   await load(pi);
   await assert.rejects(search(), /subscription-only/);
+  await assertNewToolsBlocked(/subscription-only/);
   await commands.get("nano-gpt-subscription").handler("off", ctx);
   await search();
   assert.equal(requests.filter(({ url }) => url.endsWith("/api/web")).length, 2);
@@ -336,5 +353,6 @@ test("extension integration: file key, any selected model, live billing switch, 
   const count = requests.length;
   await assert.rejects(search(), /No NanoGPT API key/);
   await assert.rejects(scrape(), /No NanoGPT API key/);
+  await assertNewToolsBlocked(/No NanoGPT API key/);
   assert.equal(requests.length, count);
 });
