@@ -70,6 +70,7 @@ repository, then copy the extension into a subdirectory:
 git clone https://github.com/idrassi/pi-extension-nano-gpt.git
 mkdir -p ~/.pi/agent/extensions/nano-gpt
 cp pi-extension-nano-gpt/index.ts pi-extension-nano-gpt/web-tools.ts \
+  pi-extension-nano-gpt/web-auth.ts pi-extension-nano-gpt/web-output.ts \
   pi-extension-nano-gpt/package.json ~/.pi/agent/extensions/nano-gpt/
 ```
 
@@ -167,9 +168,14 @@ them and remembers the choice in `nano-gpt.json` (`"subscriptionOnly":` boolean)
 /nano-gpt-subscription        # status + interactive picker
 ```
 
-The toggle re-registers the provider immediately (no `/reload`) and refetches
-the catalogue from the matching endpoint. If the current model is not in the
-new catalogue you are prompted to `/model` again.
+When this extension registered inference using an env/file key, the toggle
+re-registers the provider immediately (no `/reload`) and refetches the catalogue
+from the matching endpoint. If the current model is not in the new catalogue
+you are prompted to `/model` again. Without an env/file key at startup, the
+command still changes and persists the paid-web-tool guard, but does not
+reconfigure an independently registered inference provider; its billing mode
+must be verified separately. The status bar explicitly identifies that case
+rather than claiming inference is subscription-only.
 
 ## Web tools
 
@@ -188,11 +194,16 @@ public pages, map/crawl a site, retrieve video transcripts, or research a topic:
 | `nano_gpt_youtube_transcript` | Retrieve transcripts for 1–10 YouTube videos | `POST https://api.nano-gpt.com/api/youtube-transcribe` |
 | `nano_gpt_web_research` | Produce a cited multi-source report via Sofya | `POST https://api.nano-gpt.com/api/web` |
 
-All use the existing `NANO_GPT_API_KEY` / `nano-gpt.json` inference key, never
-the Management API token. They do not change inference requests or silently
-add `:online` / `scraping` options. Provider routing pins, service tiers, and
-Claude caching do not apply to these standalone requests. Without a key, calls
-fail with setup instructions rather than making an unauthenticated request.
+When the NanoGPT provider is registered, all tools resolve its credential through
+pi at execution time, including stored `/login` or runtime credentials that take
+precedence over `NANO_GPT_API_KEY` / `nano-gpt.json`. This remains true when the
+active model belongs to another provider. A registered provider's missing or
+failed authentication never silently falls back to another key/account. Only
+when the NanoGPT provider is absent do the tools use the environment/file key
+directly. They never use the Management API token or forward inference-specific
+headers, routing pins, service tiers, or Claude caching controls. They do not
+change inference requests or silently add `:online` / `scraping` options.
+Without a key, calls fail rather than making an unauthenticated request.
 
 Search and scrape keep using `https://nano-gpt.com`. The other five tools use
 `https://api.nano-gpt.com` for longer runtimes, following the
@@ -237,7 +248,10 @@ for provider behavior and current prices.
 - `urls`: 1–5 absolute HTTP(S) URLs, standard web ports only, no embedded
   credentials. NanoGPT rejects localhost/private IPs, metadata endpoints,
   and unsupported YouTube targets; pages are fetched remotely, not by pi.
-- `provider`: `auto` (default) or `linkup`.
+- `provider`: `auto` (default) or `linkup`. Automatic routing may charge per
+  **PDF page**, not just per URL. Five URLs is not a spending cap; agree on
+  potentially variable PDF costs before submitting. No PDF-page or dollar cap
+  is enforced by this tool.
 - `format`: `markdown` (default) or `html`. Only one representation is returned
   to the model, falling back to available content if necessary.
 - `stealthMode`: `false` by default. Explicitly enabling it uses the stealth
@@ -287,7 +301,9 @@ Both submit `operation: "map"` or `"crawl"` to `/api/v1/data/firecrawl`:
 - **`maxTotalChargeUsd` is required**, greater than $0 and at most $5. It is sent
   upstream as a requested spending cap, not a verified guarantee: the official
   NanoGPT MCP exposes this field, but server-side enforcement has not been
-  independently verified. Agree on a spending cap before submitting.
+  independently verified. Agree on a spending cap before submitting. The value
+  is supplied by the model, not a user-authorization check or a session budget;
+  concurrent calls each carry their own requested cap.
 - `waitForFinishSecs`: 5–240 seconds, default 240 (NanoGPT caps the server wait
   at 240). `timeout`: 1–300 seconds, default 270, and must be at least
   `waitForFinishSecs + 30`. Lower the server wait when choosing a shorter timeout.
@@ -300,7 +316,10 @@ JSON is retained, including any job, status, data, billing, and partial failures
 a returned job/status does **not** prove completion. Inspect the response rather
 than assuming an empty or pending result is finished. Do not automatically
 resubmit when completion is unknown: cancellation, timeout, or reaching the
-server wait may not stop remote jobs or spending.
+server wait may not stop remote jobs or spending. These are one-shot submission
+and response-inspection tools, not a complete asynchronous job client: there is
+no job-retrieval or deduplication mechanism. A pending response may require
+manual follow-up through NanoGPT rather than another submission.
 
 ### YouTube transcripts
 
@@ -349,14 +368,19 @@ for Firecrawl.
 ### Billing, privacy, and limits
 
 **Web requests are billed separately from inference/subscription quotas.**
-NanoGPT currently documents Linkup standard search at $0.006/request, deep at
-$0.06/request, and standard scraping at $0.001/successful URL. Sofya extraction
-is documented at $0.02625/request and research at $0.13125/request; YouTube at
-$0.01/successful transcript. Firecrawl uses variable, credit-based pricing.
-Other providers, stealth mode, or BYOK have different billing. Consult the
-linked API docs for current rates. The tool output includes upstream-reported
-costs when present; these are not added to pi's model-token cost estimate.
-Tool bounds are local safety limits, not claims about API maxima.
+NanoGPT documents Linkup standard search at $0.006/request and deep at
+$0.06/request. Scraping documentation and deployment metadata differ: the static
+scraping page quotes $0.001/successful URL, while public
+[`url.scrape` metadata](https://nano-gpt.com/api/v1/data/url/scrape) reports
+$0.0015 per Linkup URL or per webpage/**PDF page** with automatic routing.
+Do not assume one URL is one billable page; verify current rates and PDF behavior
+with NanoGPT before a potentially large job. Sofya extraction is documented at
+$0.02625/request and research at $0.13125/request; YouTube at $0.01/successful
+transcript. Firecrawl uses variable, credit-based pricing. Other providers,
+stealth mode, or BYOK have different billing. The tool output includes
+upstream-reported costs when present; these are not added to pi's model-token
+cost estimate. Tool bounds are local safety limits, not claims about API maxima.
+Neither response-size limits nor timeouts bound work already processed or billed.
 
 To preserve the extension's no-balance-spending guarantee, all seven tools **refuse
 to run while `/nano-gpt-subscription on` is active**, including after reload.
@@ -375,11 +399,23 @@ in the OS temporary directory; the result includes its path. Long lines in the
 text artifact are soft-wrapped so pi's `read` tool can continue with line offsets
 (the artifact is not machine-readable JSON). These files are
 not automatically deleted at session end, so they remain readable; remove them
-when no longer needed. Oversized billing metadata is also bounded in persisted
-tool details; the complete response remains in the output text/artifact.
-Responses larger than 10 MiB are rejected as a safety limit. Esc cancellation
-and the request timeout apply to response downloads as
-well as connection setup. HTTP/API errors are reported without automatic retries.
+when no longer needed. Oversized metadata is bounded in persisted tool details,
+retaining recognized cost/count scalars and nested NanoGPT billing fields where
+possible. Artifact saving is best-effort: if temporary storage is unavailable,
+the tool still returns its bounded preview and billing details, with a warning
+and no fabricated file path. Do not repeat a paid request solely to recover an
+artifact that could not be saved.
+
+Responses larger than 10 MiB, with more than 64 nested containers, or exceeding
+100,000 JSON tokens (values/property names) are rejected as safety limits before
+recursive processing. Credential redaction has a separate expansion limit.
+Output serialization is bounded to 16 MiB to avoid pretty-printing amplification;
+exceptionally large formatted output may be
+incomplete even in its artifact, as indicated in the result. Safety rejection
+after receiving a response does not undo billing. Esc cancellation and the
+request timeout cover authentication and response downloads as well as connection
+setup; output persistence also honors Esc. HTTP/API errors are reported without
+automatic retries.
 
 ## Claude prompt caching
 
@@ -522,15 +558,31 @@ allows creating, updating, and revoking inference keys; protect it accordingly.
 npm run check   # runs node --test (Node.js 22.19.0+)
 ```
 
+Two additional offline integration tests use an installed pi runtime's actual
+credential resolution and argument validation. To enable them, point
+`PI_TEST_RUNTIME_DIR` at the `@earendil-works/pi-coding-agent` package directory:
+
+```sh
+PI_TEST_RUNTIME_DIR=/path/to/node_modules/@earendil-works/pi-coding-agent npm run check
+```
+
+These tests use in-memory credentials and mocked transport; they do not submit
+billable API calls or verify NanoGPT's server-side spending enforcement.
+
 ## Files
 
 - `index.ts` — provider registration, preferences, commands, and hooks
-- `web-tools.ts` — standalone web tool schemas, API calls, and bounded output
+- `web-tools.ts` — standalone web tool schemas, validation, and API calls
+- `web-auth.ts` — request-time NanoGPT credential resolution through pi
+- `web-output.ts` — response complexity limits, bounded serialization, and best-effort artifacts
 - `package.json` — pi extension manifest and check script (no npm dependencies)
 - `test/model-catalogue.test.mjs` — canonical endpoint, discovery, and billing-mode regression test
 - `test/service-tier.test.mjs` — runtime switch integration test
 - `test/web-tools.test.mjs` — web API contracts, billing guard, cancellation, output limits, and extension integration
 - `test/research-tools.test.mjs` — extraction, site map/crawl, YouTube transcript, and research API contracts and safeguards
+- `test/web-auth.test.mjs` — credential precedence, fail-closed resolution, and optional pi runtime integration
+- `test/web-output.test.mjs` — response complexity, output limits, and filesystem-failure recovery
+- `test/web-subscription.test.mjs` — runtime-only credential spending guard and persistence
 - `LICENSE` — MIT license
 
 ## License

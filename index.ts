@@ -101,6 +101,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerWebTools } from "./web-tools.ts";
+import { resolveWebApiKey } from "./web-auth.ts";
 import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -1016,10 +1017,14 @@ export default async function (pi: ExtensionAPI) {
 
   if (!keyMissing) await registerProviderForMode();
 
-  // Standalone, separately billed tools work with any active model. They reuse
-  // the inference credential but never send routing/tier/management headers.
+  // Standalone, separately billed tools work with any active model. Resolve
+  // Pi's current NanoGPT inference credential (including /login/runtime keys),
+  // falling back to env/file only when its provider is absent. Never copy
+  // provider routing/tier/management headers into standalone requests.
   registerWebTools(pi, {
-    getApiKey: () => process.env.NANO_GPT_API_KEY?.trim() || loadKeyFromFile(),
+    getApiKey: (ctx, signal) => resolveWebApiKey(
+      ctx, () => process.env.NANO_GPT_API_KEY?.trim() || loadKeyFromFile(), signal,
+    ),
     isSubscriptionOnly: () => subscriptionOnly,
   });
 
@@ -1061,7 +1066,9 @@ export default async function (pi: ExtensionAPI) {
       return;
     }
     let label: string;
-    if (subscriptionOnly) {
+    if (keyMissing) {
+      label = `web tools ${subscriptionOnly ? "blocked" : "allowed"} · inference mode external`;
+    } else if (subscriptionOnly) {
       label = "subscription";
     } else {
       const pref = routingPrefs[active.id];
@@ -1119,10 +1126,6 @@ export default async function (pi: ExtensionAPI) {
         .filter((v) => v.startsWith(prefix))
         .map((v) => ({ value: v, label: v })),
     handler: async (args, ctx) => {
-      if (keyMissing) {
-        ctx.ui.notify("[nano-gpt] no API key — configure one first", "warning");
-        return;
-      }
       let arg = args.trim().toLowerCase();
       if (!arg) {
         if (!ctx.hasUI) {
@@ -1155,12 +1158,23 @@ export default async function (pi: ExtensionAPI) {
       if (!savePersistedConfig({ subscriptionOnly })) {
         ctx.ui.notify(`[nano-gpt] could not write ${KEY_FILE} — mode reverts on reload`, "warning");
       }
+      updateStatus(ctx); // the paid-tool guard changes before any catalogue I/O
+      // Tools can use stored/runtime credentials even when this extension has
+      // no env/file key and did not register an inference provider. The local
+      // spending guard must remain usable; do not overwrite another provider
+      // registration or imply that its inference billing URL was changed.
+      if (keyMissing) {
+        ctx.ui.notify(
+          `[nano-gpt] paid web tools ${next ? "BLOCKED" : "ALLOWED"}. No env/file inference key was configured at startup; inference provider configuration was not changed. Verify its billing mode separately.`,
+          "warning",
+        );
+        return;
+      }
       ctx.ui.notify(
         `[nano-gpt] subscription-only ${next ? "ON" : "OFF"} — base URL ${baseUrlFor(next)}, refreshing catalogue...`,
         "info",
       );
       const models = await registerProviderForMode();
-      updateStatus(ctx); // indicator switches between "subscription" and routing
       if (catalogSource === "fallback") {
         ctx.ui.notify(
           "[nano-gpt] live catalogue unreachable — showing the curated fallback list, which may not match this billing mode's real catalogue",
@@ -1551,7 +1565,7 @@ export default async function (pi: ExtensionAPI) {
     if (event.reason !== "startup" && event.reason !== "reload") return;
     if (keyMissing) {
       ctx.ui.notify(
-        `[nano-gpt] No API key found. Set NANO_GPT_API_KEY or add one to ${KEY_FILE}.`,
+        `[nano-gpt] No env/file inference key found; this extension did not register an inference provider. Web tools can still use independently registered NanoGPT runtime credentials (currently ${subscriptionOnly ? "blocked" : "allowed"}). Set NANO_GPT_API_KEY or add a key to ${KEY_FILE} to configure inference here.`,
         "warning",
       );
       return;

@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { registerWebTools } from "../web-tools.ts";
 
-function setup(t, { apiKey = "test-key", subscriptionOnly = false } = {}) {
+function setup(t, { apiKey = "test-key", subscriptionOnly = false, getApiKey } = {}) {
   const tools = new Map();
   const requests = [];
   const replies = [];
   const state = { apiKey, subscriptionOnly };
   registerWebTools({ registerTool(tool) { tools.set(tool.name, tool); } }, {
-    getApiKey: () => state.apiKey,
+    getApiKey: getApiKey ?? (() => state.apiKey),
     isSubscriptionOnly: () => state.subscriptionOnly,
   });
   t.mock.method(globalThis, "fetch", async (url, init) => {
@@ -105,6 +106,9 @@ test("rejects invalid cross-field search options before billing", async (t) => {
     { query: "q", fromDate: "2026-02-30" }, { query: "q", toDate: "not-a-date" },
     { query: "q", fromDate: "2026-02-02", toDate: "2026-02-01" },
     { query: "q", maxResults: 5 }, { query: "q", topic: "news" }, { query: "q", freshness: "day" },
+    { query: "q", provider: "sofya", freshness: "yesterday" },
+    { query: "q", provider: "sofya", freshness: "2026-02-30:2026-03-01" },
+    { query: "q", provider: "sofya", freshness: "2026-03-01:2026-02-01" },
     { query: "q", timeout: 0 }, { query: "q", timeout: 181 },
   ]) await assert.rejects(search(args));
   assert.equal(requests.length, 0);
@@ -166,6 +170,35 @@ test("billing guard and missing key fail without network traffic; options resolv
   assert.equal(requests[0].headers.Authorization, "Bearer new-key");
 });
 
+test("async authentication rechecks cancellation and the live spending guard before submission", async (t) => {
+  let resolveKey;
+  const { search, requests, state } = setup(t, {
+    getApiKey: () => new Promise((resolve) => { resolveKey = resolve; }),
+  });
+  const blocked = search({ query: "q" });
+  state.subscriptionOnly = true;
+  resolveKey("test-key");
+  await assert.rejects(blocked, /subscription-only/);
+  assert.equal(requests.length, 0);
+
+  state.subscriptionOnly = false;
+  const caller = new AbortController();
+  const cancelled = search({ query: "q" }, caller.signal);
+  caller.abort();
+  resolveKey("test-key");
+  await assert.rejects(cancelled, /cancelled; no paid web request was submitted/);
+  assert.equal(requests.length, 0);
+});
+
+test("Sofya search accepts valid freshness periods and calendar ranges", async (t) => {
+  const { search, replies, requests } = setup(t);
+  for (const freshness of ["day", "week", "month", "year", "2024-02-29:2026-01-01"]) {
+    replies.push({ data: [] });
+    await search({ query: "q", provider: "sofya", freshness });
+    assert.equal(requests.at(-1).body.freshness, freshness);
+  }
+});
+
 test("surfaces string/nested API errors, HTTP status and non-JSON responses, without retries or secrets", async (t) => {
   const { search, replies, requests } = setup(t);
   for (const [status, body, expected] of [
@@ -210,7 +243,7 @@ test("cancellation aborts fetch and the response body, including already-aborted
     init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
     fetching.abort();
   }));
-  await assert.rejects(search({ query: "q" }, fetching.signal), /cancelled/);
+  await assert.rejects(search({ query: "q" }, fetching.signal), /cancelled.*billed.*Do not automatically resubmit/);
 
   const reading = new AbortController();
   replies.push((_url, init) => new Response(new ReadableStream({
@@ -219,7 +252,7 @@ test("cancellation aborts fetch and the response body, including already-aborted
       queueMicrotask(() => reading.abort());
     },
   })));
-  await assert.rejects(search({ query: "q" }, reading.signal), /cancelled/);
+  await assert.rejects(search({ query: "q" }, reading.signal), /cancelled.*billed.*Do not automatically resubmit/);
 });
 
 test("timeout remains active while reading a stalled response body", async (t) => {
@@ -247,6 +280,35 @@ test("oversized responses are cancelled before parsing", async (t) => {
   assert.equal(wasCancelled, true);
 });
 
+test("response complexity limits reject tiny deeply nested JSON and formatting-amplification payloads", async (t) => {
+  const { search, replies, requests } = setup(t);
+  const nested = '{"data":' + "[".repeat(4000) + "0" + "]".repeat(4000) + "}";
+  const amplified = '{"data":' + "[".repeat(200) + "[" + "0,".repeat(299999) + "0]" + "]".repeat(200) + "}";
+  const wide = '{"data":[' + "0,".repeat(100001) + "0]}";
+  for (const raw of [nested, amplified, wide]) {
+    replies.push(() => new Response(raw));
+    await assert.rejects(search({ query: "q" }), (error) => {
+      assert.doesNotMatch(error.message, /call stack|Invalid string length/);
+      assert.match(error.message, /safety limit|complexity limit/);
+      assert.match(error.message, /billed/);
+      return true;
+    });
+  }
+  assert.equal(requests.length, 3, "response safety failures must not retry paid requests");
+});
+
+test("short credentials cannot amplify opaque responses through unbounded redaction", async (t) => {
+  const { search, replies, requests } = setup(t, { apiKey: "a" });
+  replies.push({ data: "a".repeat(2 * 1024 * 1024) });
+  await assert.rejects(search({ query: "q" }), (error) => {
+    assert.match(error.message, /red\[redacted\]ction exceeded its s\[redacted\]fety limit/);
+    assert.match(error.message, /billed/);
+    assert.ok(error.message.length <= 2048);
+    return true;
+  });
+  assert.equal(requests.length, 1);
+});
+
 test("large byte/line outputs are bounded and saved to private distinct local files", async (t) => {
   const { search, replies } = setup(t);
   for (const data of ["世".repeat(40_000), Array.from({ length: 2500 }, (_, i) => ({ title: `row ${i}` }))]) {
@@ -269,6 +331,25 @@ test("large byte/line outputs are bounded and saved to private distinct local fi
       assert.equal(statSync(dirname(path)).mode & 0o777, 0o700);
     }
   }
+});
+
+test("successful paid search survives unavailable artifact storage without another request", async (t) => {
+  const { search, replies, requests } = setup(t);
+  t.mock.method(fs, "mkdtemp", async () => {
+    throw Object.assign(new Error("private path and unrelated credentials"), { code: "ENOSPC" });
+  });
+  const metadata = { cost: 0.006, provider: "linkup", trace: "trace".repeat(1000) };
+  replies.push({ data: { answer: "useful source material ".repeat(5000) }, metadata });
+  const result = await search({ query: "q" });
+  assert.equal(requests.length, 1);
+  assert.match(text(result), /useful source material/);
+  assert.match(text(result), /could not be saved.*ENOSPC/);
+  assert.match(text(result), /Do not repeat the paid request/);
+  assert.doesNotMatch(text(result), /private path|unrelated credentials/);
+  assert.equal(result.details.metadata.cost, 0.006);
+  assert.equal(result.details.fullOutputPath, undefined);
+  assert.equal(result.details.artifactError, "ENOSPC");
+  assert.ok(Buffer.byteLength(text(result)) <= 50 * 1024);
 });
 
 test("extension integration: file key, any selected model, live billing switch, and legacy config preservation", async (t) => {
@@ -294,6 +375,8 @@ test("extension integration: file key, any selected model, live billing switch, 
   const tools = new Map();
   const requests = [];
   let expectedKey = "file-key";
+  let registeredProvider;
+  let runtimeKey;
   t.mock.method(globalThis, "fetch", async (url, init = {}) => {
     requests.push({ url, ...init });
     if (url.endsWith("/models?detailed=true")) return Response.json({ data: [{ id: "vendor/model" }] });
@@ -307,11 +390,24 @@ test("extension integration: file key, any selected model, live billing switch, 
   const pi = {
     registerTool(tool) { tools.set(tool.name, tool); },
     registerCommand(name, value) { commands.set(name, value); },
-    registerProvider() {}, on() {},
+    registerProvider(name, provider) {
+      assert.equal(name, "nano-gpt");
+      registeredProvider = provider;
+    },
+    on() {},
   };
   const { default: load } = await import("../index.ts");
   await load(pi);
-  const ctx = { hasUI: false, model: { id: "other-model", provider: "another-provider" }, ui: { notify() {}, setStatus() {} } };
+  const ctx = {
+    hasUI: false, model: { id: "other-model", provider: "another-provider" }, ui: { notify() {}, setStatus() {} },
+    modelRegistry: {
+      getProvider(name) { assert.equal(name, "nano-gpt"); return registeredProvider; },
+      async getProviderAuth(name) {
+        assert.equal(name, "nano-gpt");
+        return { auth: { apiKey: runtimeKey ?? process.env.NANO_GPT_API_KEY, headers: { "x-routing": "not-for-web" } } };
+      },
+    },
+  };
   const search = () => tools.get("nano_gpt_web_search").execute("id", { query: "q" }, undefined, undefined, ctx);
   const newTools = {
     nano_gpt_web_extract: { url: "https://example.com", prompt: "Extract prices" },
@@ -339,13 +435,20 @@ test("extension integration: file key, any selected model, live billing switch, 
   await search();
   assert.equal(requests.filter(({ url }) => url.endsWith("/api/web")).length, 2);
 
-  // Environment inference key wins over both the file key and management credentials.
+  // Without a runtime/stored override, the provider's environment key wins
+  // over the file key and management credentials.
   writeFileSync(config, JSON.stringify({ apiKey: "file-key", managementToken: "file-management-secret" }));
   process.env.NANO_GPT_API_KEY = expectedKey = "env-key";
   await load(pi);
   await search();
   const scrape = () => tools.get("nano_gpt_web_scrape").execute("id", { urls: ["https://example.com"] });
   await scrape();
+
+  // The callback wired by index.ts must use runtime NanoGPT auth even with
+  // another provider's model selected and a conflicting environment key.
+  runtimeKey = expectedKey = "runtime-key";
+  await search();
+  runtimeKey = undefined;
 
   // Having only a management token must not authorize a web request.
   delete process.env.NANO_GPT_API_KEY;
