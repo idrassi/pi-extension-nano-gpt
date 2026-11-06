@@ -84,6 +84,7 @@ test("discovers new models on the canonical host and keeps billing and routing e
   const commands = new Map();
   const providers = [];
   const pi = {
+    registerTool() {},
     registerCommand(name, command) { commands.set(name, command); },
     registerProvider(name, provider) { providers.push({ name, provider }); },
     on() {},

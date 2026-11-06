@@ -100,6 +100,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerWebTools } from "./web-tools.ts";
 import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -968,8 +969,8 @@ export default async function (pi: ExtensionAPI) {
   }
 
   const apiKey = process.env.NANO_GPT_API_KEY;
-  if (!apiKey || isPlaceholderKey(apiKey)) {
-    keyMissing = true;
+  keyMissing = !apiKey || isPlaceholderKey(apiKey);
+  if (keyMissing) {
     console.error(`[nano-gpt] no NANO_GPT_API_KEY env var and no key in ${KEY_FILE}`);
   }
 
@@ -1014,6 +1015,13 @@ export default async function (pi: ExtensionAPI) {
   };
 
   if (!keyMissing) await registerProviderForMode();
+
+  // Standalone, separately billed tools work with any active model. They reuse
+  // the inference credential but never send routing/tier/management headers.
+  registerWebTools(pi, {
+    getApiKey: () => process.env.NANO_GPT_API_KEY?.trim() || loadKeyFromFile(),
+    isSubscriptionOnly: () => subscriptionOnly,
+  });
 
   // Resolved lazily because most sessions never open the ZDR switch. The
   // inference key cannot change within a loaded extension; /reload creates a

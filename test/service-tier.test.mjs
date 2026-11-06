@@ -13,6 +13,7 @@ function mockPi() {
     hooks,
     providers,
     api: {
+      registerTool() {},
       registerCommand(name, command) { commands.set(name, command); },
       registerProvider(name, provider) { providers.push({ name, provider }); },
       on(name, handler) { hooks.set(name, handler); },

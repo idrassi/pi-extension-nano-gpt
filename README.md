@@ -44,6 +44,10 @@ at upstream list price — as a pi provider.
   base price, including cache reads.
 - **Privacy routing:** `/nano-gpt-zdr` reads and switches the active inference
   key's live Zero Data Retention policy through NanoGPT's Management API.
+- **Web tools:** `nano_gpt_web_search` and `nano_gpt_web_scrape` expose NanoGPT's
+  standalone search and page-reading APIs to any tool-capable model in pi.
+  They reuse the inference key and are billed separately from model tokens.
+  See [Web search and scraping](#web-search-and-scraping).
 
 ## Install
 
@@ -64,7 +68,8 @@ repository, then copy the extension into a subdirectory:
 ```sh
 git clone https://github.com/idrassi/pi-extension-nano-gpt.git
 mkdir -p ~/.pi/agent/extensions/nano-gpt
-cp pi-extension-nano-gpt/index.ts pi-extension-nano-gpt/package.json ~/.pi/agent/extensions/nano-gpt/
+cp pi-extension-nano-gpt/index.ts pi-extension-nano-gpt/web-tools.ts \
+  pi-extension-nano-gpt/package.json ~/.pi/agent/extensions/nano-gpt/
 ```
 
 Copy again after pulling updates. The extension then loads globally with **no
@@ -164,6 +169,104 @@ them and remembers the choice in `nano-gpt.json` (`"subscriptionOnly":` boolean)
 The toggle re-registers the provider immediately (no `/reload`) and refetches
 the catalogue from the matching endpoint. If the current model is not in the
 new catalogue you are prompted to `/model` again.
+
+## Web search and scraping
+
+Two ordinary pi tools are registered automatically; no MCP server, extra key,
+model suffix, or npm dependency is needed. They work with **any tool-capable
+model**, not just models served by NanoGPT. Ask pi to search for current
+information or read a public URL, and the model can call:
+
+| Tool | Purpose | NanoGPT endpoint |
+|---|---|---|
+| `nano_gpt_web_search` | Search with explicit query and source URLs | `POST https://nano-gpt.com/api/web` |
+| `nano_gpt_web_scrape` | Read 1–5 public pages as markdown or HTML | `POST https://nano-gpt.com/api/scrape-urls` |
+
+Both use the existing `NANO_GPT_API_KEY` / `nano-gpt.json` inference key, never
+the Management API token. They do not change inference requests or silently
+add `:online` / `scraping` options. Provider routing pins, service tiers, and
+Claude caching do not apply to these standalone requests. Without a key, calls
+fail with setup instructions rather than making an unauthenticated request.
+
+### Search options
+
+Minimal tool arguments:
+
+```json
+{ "query": "latest Node.js LTS release notes" }
+```
+
+The default is Linkup `standard` with `searchResults`. Available options:
+
+- `provider`: `linkup` (default), `tavily`, `exa`, `kagi`, `perplexity`, `valyu`,
+  `brave`, `sofya`, or `firecrawl`.
+- Linkup only: `depth` (`standard` or `deep`); `outputType` (`searchResults`,
+  `sourcedAnswer`, or `structured`). Structured output requires
+  `structuredOutputSchema`, a JSON schema **encoded as a string**. Other
+  providers support `searchResults` only.
+- `includeImages`, `fromDate` / `toDate` (`YYYY-MM-DD`), and `includeDomains` /
+  `excludeDomains` (up to 10 domains each). Filter support varies by provider.
+- Sofya only: `maxResults` (1–20), `topic` (`general` or `news`), `freshness`
+  (`day`, `week`, `month`, `year`, or `YYYY-MM-DD:YYYY-MM-DD`). This tool exposes
+  Sofya search, not its separate fetch/extract/research operations.
+- `timeout`: 1–180 seconds, default 120, including response download.
+
+Search results retain the provider's data and `metadata`, including source
+URLs and reported request cost. Incompatible option combinations are rejected
+before making a billable request. See the
+[Direct Web Search API](https://docs.nano-gpt.com/api-reference/endpoint/web-search)
+for provider behavior and current prices.
+
+### Page-reading options
+
+```json
+{ "urls": ["https://nodejs.org/en/about/previous-releases"] }
+```
+
+- `urls`: 1–5 absolute HTTP(S) URLs, standard web ports only, no embedded
+  credentials. NanoGPT rejects localhost/private IPs, metadata endpoints,
+  and unsupported YouTube targets; pages are fetched remotely, not by pi.
+- `provider`: `auto` (default) or `linkup`.
+- `format`: `markdown` (default) or `html`. Only one representation is returned
+  to the model, falling back to available content if necessary.
+- `stealthMode`: `false` by default. Explicitly enabling it uses the stealth
+  proxy at **5×** the standard price. Not supported with `provider: "linkup"`.
+- `timeout`: 1–180 seconds, default 120.
+
+Per-URL failures and the billing `summary` are preserved. A partially successful
+batch returns the usable pages plus errors; an entirely failed batch is marked
+as a tool error. See the
+[Web Scraping API](https://docs.nano-gpt.com/api-reference/endpoint/scrape-urls).
+
+### Billing, privacy, and limits
+
+**Web requests are billed separately from inference/subscription quotas.**
+NanoGPT currently documents Linkup standard search at $0.006/request, deep at
+$0.06/request, and standard scraping at $0.001/successful URL; other providers,
+stealth mode, or BYOK have different billing. Consult the linked API docs for
+current rates. The tool output includes upstream-reported costs when present;
+these are not added to pi's model-token cost estimate.
+
+To preserve the extension's no-balance-spending guarantee, both tools **refuse
+to run while `/nano-gpt-subscription on` is active**, including after reload.
+Use `/nano-gpt-subscription off` to allow paid web requests. The tools remain
+registered so the model can see the reason for refusal; there is no hidden
+pay-as-you-go fallback. Requests are never automatically retried: even a
+cancelled or timed-out request may already have been billed.
+
+Queries and URLs are sent to NanoGPT and its search/page-reading providers.
+**Inference ZDR routing does not establish ZDR guarantees for these tools.**
+Retrieved content is untrusted source material, not instructions.
+
+Model-facing output is limited to **50 KiB or 2,000 lines**. When truncated,
+the full text is saved under a private `pi-nano-gpt-web-*` directory
+in the OS temporary directory; the result includes its path. Long lines in the
+text artifact are soft-wrapped so pi's `read` tool can continue with line offsets
+(the artifact is not machine-readable JSON). These files are
+not automatically deleted at session end, so they remain readable; remove them
+when no longer needed. Responses larger than 10 MiB are rejected as a safety
+limit. Esc cancellation and the request timeout apply to response downloads as
+well as connection setup. HTTP/API errors are reported without automatic retries.
 
 ## Claude prompt caching
 
@@ -308,10 +411,12 @@ npm run check   # runs node --test (Node.js 22.19.0+)
 
 ## Files
 
-- `index.ts` — the extension
+- `index.ts` — provider registration, preferences, commands, and hooks
+- `web-tools.ts` — standalone web tool schemas, API calls, and bounded output
 - `package.json` — pi extension manifest and check script (no npm dependencies)
 - `test/model-catalogue.test.mjs` — canonical endpoint, discovery, and billing-mode regression test
 - `test/service-tier.test.mjs` — runtime switch integration test
+- `test/web-tools.test.mjs` — web API contracts, billing guard, cancellation, output limits, and extension integration
 - `LICENSE` — MIT license
 
 ## License
