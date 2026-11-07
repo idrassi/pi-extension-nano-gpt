@@ -105,6 +105,8 @@ Then run `/reload` in pi (or restart it). If `PI_CODING_AGENT_DIR` is set, the
 file lives in that directory instead of `~/.pi/agent/`.
 
 Alternatively, `export NANO_GPT_API_KEY=...` takes precedence over the file.
+Pi's stored `/login` credentials and runtime key overrides take precedence over
+this provider configuration when resolving inference, web-tool, and ZDR credentials.
 
 ## Zero Data Retention routing
 
@@ -112,7 +114,19 @@ NanoGPT implements ZDR as a server-side policy on an inference API key. It is
 not a chat-completions parameter or model suffix. The extension identifies the
 active inference key through `GET /api/v1/usage`, reads its current policy, and
 updates that exact key through the
-[Management API](https://docs.nano-gpt.com/api-reference/management-api):
+[Management API](https://docs.nano-gpt.com/api-reference/management-api).
+Each command resolves NanoGPT's current pi credential, even when another provider's
+model is selected, then discovers its key ID afresh. Stored `/login` and runtime
+credentials win over environment/file configuration. Registered-provider auth
+failures never silently select an environment key from a different account;
+environment/file fallback is used only when NanoGPT is not registered. Runtime-only
+credentials are supported without an env/file key.
+
+If credentials change during a control-plane read or the interactive picker, the
+command refuses to submit the policy update and asks you to run it again for the
+current key. An already-submitted update still applies to its identified key,
+not to credentials selected afterward. Inference and management credentials are
+kept separate, omitted from notifications, and never forwarded through redirects.
 
 ```
 /nano-gpt-zdr             # live status + interactive switch
@@ -558,8 +572,8 @@ allows creating, updating, and revoking inference keys; protect it accordingly.
 npm run check   # runs node --test (Node.js 22.19.0+)
 ```
 
-Two additional offline integration tests use an installed pi runtime's actual
-credential resolution and argument validation. To enable them, point
+Additional offline integration tests use an installed pi runtime's actual
+credential resolution, ZDR command integration, and argument validation. To enable them, point
 `PI_TEST_RUNTIME_DIR` at the `@earendil-works/pi-coding-agent` package directory:
 
 ```sh
@@ -583,6 +597,7 @@ billable API calls or verify NanoGPT's server-side spending enforcement.
 - `test/web-auth.test.mjs` — credential precedence, fail-closed resolution, and optional pi runtime integration
 - `test/web-output.test.mjs` — response complexity, output limits, and filesystem-failure recovery
 - `test/web-subscription.test.mjs` — runtime-only credential spending guard and persistence
+- `test/zdr.test.mjs` — live credential targeting, rotation, fail-closed policy updates, and optional pi runtime integration
 - `LICENSE` — MIT license
 
 ## License

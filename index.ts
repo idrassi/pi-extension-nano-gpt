@@ -39,10 +39,11 @@
  * "max" when present, else xhigh/high/...), so defaultThinkingLevel "max"
  * always resolves to the model's ceiling.
  *
- * API key resolution: NANO_GPT_API_KEY env var wins; otherwise the key is read
- * from ~/.pi/agent/nano-gpt.json (see loadKeyFromFile). The file key is backfilled
- * into process.env so the provider's apiKey ("$NANO_GPT_API_KEY") resolves per
- * request with no escaping concerns for keys containing $ or !.
+ * API key configuration: NANO_GPT_API_KEY wins over ~/.pi/agent/nano-gpt.json
+ * (see loadKeyFromFile). The file key is backfilled into process.env so the
+ * provider's apiKey ("$NANO_GPT_API_KEY") resolves per request. Pi's stored and
+ * runtime credentials take precedence; web tools and ZDR commands resolve that
+ * same live NanoGPT credential, independently of the active model provider.
  *
  * Billing modes: /nano-gpt-subscription toggles between the standard
  * pay-as-you-go base (/api/v1, the default) and subscription-only
@@ -99,7 +100,7 @@
  * changes nothing; if it lived only in nano-gpt.json, this widens exposure.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerWebTools } from "./web-tools.ts";
 import { resolveWebApiKey } from "./web-auth.ts";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -695,7 +696,8 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    // Control-plane credentials must never follow redirects to another host.
+    return await fetch(url, { ...init, signal: controller.signal, redirect: "error" });
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
       throw new Error(`request timed out after ${FETCH_TIMEOUT_MS / 1000}s`);
@@ -952,7 +954,7 @@ let catalogSource: "fetched" | "fallback" = "fallback";
 // In-memory mirror of the persisted prefs; commands keep both in sync.
 let subscriptionOnly = false;
 let routingPrefs: Record<string, RoutingPref> = {};
-let serviceTiers: Record<string, ServiceTier> = {};
+let serviceTiers: Partial<Record<string, ServiceTier>> = {};
 
 export default async function (pi: ExtensionAPI) {
   // Persisted prefs (billing mode, routing, and tiers) load before the provider
@@ -1028,29 +1030,11 @@ export default async function (pi: ExtensionAPI) {
     isSubscriptionOnly: () => subscriptionOnly,
   });
 
-  // Resolved lazily because most sessions never open the ZDR switch. The
-  // inference key cannot change within a loaded extension; /reload creates a
-  // fresh instance if the user changes it.
-  let currentApiKeyId: string | undefined;
-  const getCurrentApiKeyId = async (): Promise<string> => {
-    if (currentApiKeyId) return currentApiKeyId;
-    if (!apiKey || isPlaceholderKey(apiKey)) throw new Error("no inference API key is configured");
-    currentApiKeyId = await discoverCurrentApiKeyId(apiKey);
-    return currentApiKeyId;
-  };
-
   // Minimal structural ctx shared by the helpers below: enough for notify and
   // status-bar updates. Both command handlers and event handlers receive a
   // full context that satisfies this shape.
-  type UiCtx = {
-    hasUI: boolean;
-    mode?: string;
-    model?: { id: string; provider: string } | undefined;
-    ui: {
-      notify: (msg: string, type?: "info" | "warning" | "error") => void;
-      setStatus: (key: string, text: string | undefined) => void;
-      theme?: { fg: (color: string, text: string) => string };
-    };
+  type UiCtx = Pick<ExtensionContext, "hasUI" | "mode" | "model"> & {
+    ui: Pick<ExtensionContext["ui"], "notify" | "setStatus" | "theme">;
   };
 
   // ---- Status-bar routing indicator -----------------------------------------
@@ -1257,10 +1241,6 @@ export default async function (pi: ExtensionAPI) {
         .filter((v) => v.startsWith(prefix))
         .map((v) => ({ value: v, label: v })),
     handler: async (args, ctx) => {
-      if (keyMissing) {
-        ctx.ui.notify("[nano-gpt] no API key — configure one first", "warning");
-        return;
-      }
       const managementToken = loadManagementToken();
       if (!managementToken) {
         ctx.ui.notify(
@@ -1276,16 +1256,41 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
+      // Resolve afresh for every command: /login and runtime overrides can
+      // change without reloading this extension. Never cache a key id globally.
+      const secrets = new Set([managementToken]);
+      const safe = (message: string): string => {
+        const longestSecret = Math.max(...[...secrets].map((secret) => secret.length));
+        let text = message.slice(0, 2048 + longestSecret);
+        for (const secret of secrets) text = text.replaceAll(secret, "[redacted]");
+        return text.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 2048);
+      };
+      const notify = (message: string, type: "info" | "warning" | "error") => ctx.ui.notify(safe(message), type);
+      const resolveKey = async (): Promise<string> => {
+        const key = await resolveWebApiKey(
+          ctx, () => process.env.NANO_GPT_API_KEY?.trim() || loadKeyFromFile(), AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        );
+        if (!key || isPlaceholderKey(key)) throw new Error("no NanoGPT inference API key is configured");
+        secrets.add(key);
+        return key;
+      };
       try {
-        const keyId = await getCurrentApiKeyId();
+        const inferenceKey = await resolveKey();
+        const keyId = await discoverCurrentApiKeyId(inferenceKey);
         const current = await getManagedApiKey(managementToken, keyId);
+        const assertSameCredential = async () => {
+          if (await resolveKey() !== inferenceKey) {
+            throw new Error("NanoGPT credentials changed during this command; no policy update was submitted. Run /nano-gpt-zdr again for the current key");
+          }
+        };
+        await assertSameCredential();
         if (current.status !== "active") {
-          ctx.ui.notify(`[nano-gpt] API key ${current.name} (#${keyId}) is ${current.status}`, "error");
+          notify(`[nano-gpt] API key ${current.name} (#${keyId}) is ${current.status}`, "error");
           return;
         }
 
         if (arg === "status" || (!arg && !ctx.hasUI)) {
-          ctx.ui.notify(
+          notify(
             `[nano-gpt] API-key ZDR policy is ${zdrPolicyLabel(current.zdr_policy)} for ${current.name} (#${keyId})`,
             "info",
           );
@@ -1296,7 +1301,7 @@ export default async function (pi: ExtensionAPI) {
           const onCurrent = current.zdr_policy === "zdr" ? " (current)" : "";
           const offCurrent = current.zdr_policy === "off" ? " (current)" : "";
           const choice = await ctx.ui.select(
-            `NanoGPT API-key ZDR routing for ${current.name} (#${keyId})`,
+            safe(`NanoGPT API-key ZDR routing for ${current.name} (#${keyId})`),
             [
               `on — ZDR-only routes; fail if none qualify${onCurrent}`,
               `off — Anonymized standard routing${offCurrent}`,
@@ -1305,10 +1310,13 @@ export default async function (pi: ExtensionAPI) {
           if (!choice) return;
           arg = choice.startsWith("on") ? "on" : "off";
         }
+        // Do not apply a choice made for one account after credentials change
+        // while the dialog or a control-plane request is pending.
+        await assertSameCredential();
 
         const next: Exclude<ZdrPolicy, "unset"> = arg === "on" ? "zdr" : "off";
         if (current.zdr_policy === next) {
-          ctx.ui.notify(
+          notify(
             `[nano-gpt] API-key ZDR policy already ${zdrPolicyLabel(current.zdr_policy)} for ${current.name} (#${keyId})`,
             "info",
           );
@@ -1317,13 +1325,13 @@ export default async function (pi: ExtensionAPI) {
 
         const updated = await updateManagedApiKeyZdr(managementToken, keyId, next);
         const teamNote = updated.zdr_policy === "off" ? "; team ZDR minimums still apply" : "";
-        ctx.ui.notify(
-          `[nano-gpt] API-key ZDR policy ${zdrPolicyLabel(updated.zdr_policy)} for ${updated.name} (#${keyId}) — applies to the next request${teamNote}`,
+        notify(
+          `[nano-gpt] API-key ZDR policy ${zdrPolicyLabel(updated.zdr_policy)} for ${updated.name} (#${keyId}) — applies to clients using this key${teamNote}`,
           "info",
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`[nano-gpt] ZDR switch failed: ${message}`, "error");
+        notify(`[nano-gpt] ZDR switch failed: ${message}`, "error");
       }
     },
   });
